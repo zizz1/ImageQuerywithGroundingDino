@@ -1,6 +1,6 @@
 from torchvision.datasets.vision import VisionDataset
 import os.path
-from typing import Callable, Optional
+from typing import Callable, Optional, Dict, List
 import json
 from PIL import Image
 import torch
@@ -9,6 +9,7 @@ import os, sys
 sys.path.append(os.path.dirname(sys.path[0]))
 
 import datasets.transforms as T
+import torchvision.transforms as tvT
 
 class ODVGDataset(VisionDataset):
     """
@@ -33,15 +34,35 @@ class ODVGDataset(VisionDataset):
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         transforms: Optional[Callable] = None,
+        query_root: Optional[str] = None,
+        auto_image_query: bool = False,
+        image_query_dir: Optional[str] = None,
+        per_class_query_num: int = 5,
     ) -> None:
         super().__init__(root, transforms, transform, target_transform)
         self.root = root
+        self.query_root = query_root if query_root else root
         self.dataset_mode = "OD" if label_map_anno else "VG"
         self.max_labels = max_labels
+        self.auto_image_query = auto_image_query and self.dataset_mode == "OD"
+        self.image_query_dir = (
+            image_query_dir if image_query_dir else os.path.join(self.root, "auto_image_queries")
+        )
+        self.per_class_query_num = per_class_query_num
+        self.class_query_bank: Dict[str, List[str]] = {}
         if self.dataset_mode == "OD":
             self.load_label_map(label_map_anno)
         self._load_metas(anno)
         self.get_dataset_info()
+        self.query_transform = tvT.Compose(
+            [
+                tvT.Resize((224, 224)),
+                tvT.ToTensor(),
+                tvT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        if self.auto_image_query:
+            self._prepare_image_query_bank()
 
     def load_label_map(self, label_map_anno):
         with open(label_map_anno, 'r') as file:
@@ -57,6 +78,100 @@ class ODVGDataset(VisionDataset):
         if self.dataset_mode == "OD":
             print(f"  == total labels: {len(self.label_map)}")
 
+    def _prepare_image_query_bank(self):
+        os.makedirs(self.image_query_dir, exist_ok=True)
+        for label_id, label_name in self.label_map.items():
+            bank_key = str(label_id)
+            label_dir = os.path.join(self.image_query_dir, label_name.replace(" ", "_"))
+            os.makedirs(label_dir, exist_ok=True)
+            stored_paths = []
+            existing_files = [
+                os.path.join(label_dir, f)
+                for f in os.listdir(label_dir)
+                if f.lower().endswith((".png", ".jpg", ".jpeg"))
+            ]
+            if len(existing_files) >= self.per_class_query_num:
+                stored_paths = existing_files[: self.per_class_query_num]
+            else:
+                instances = self._collect_label_instances(bank_key)
+                random.shuffle(instances)
+                selected = instances[: self.per_class_query_num]
+                for idx, (rel_path, bbox) in enumerate(selected):
+                    save_path = os.path.join(label_dir, f"{idx}_{os.path.basename(rel_path)}")
+                    if self._save_query_crop(rel_path, bbox, save_path):
+                        stored_paths.append(save_path)
+            self.class_query_bank[bank_key] = stored_paths
+
+    def _collect_label_instances(self, label_id: str):
+        results = []
+        for meta in self.metas:
+            detection = meta.get("detection", {})
+            for obj in detection.get("instances", []):
+                if str(obj.get("label")) == label_id:
+                    results.append((meta["filename"], obj["bbox"]))
+        return results
+
+    def _save_query_crop(self, rel_path, bbox, save_path):
+        abs_path = os.path.join(self.root, rel_path)
+        if not os.path.exists(abs_path):
+            return False
+        try:
+            image = Image.open(abs_path).convert("RGB")
+            x1, y1, x2, y2 = bbox
+            if x2 <= x1 or y2 <= y1:
+                return False
+            crop_box = (int(x1), int(y1), int(x2), int(y2))
+            crop = image.crop(crop_box)
+            crop.save(save_path)
+            return True
+        except Exception:
+            return False
+
+    def _load_image_query(self, meta):
+        query_meta = (
+            meta.get("image_query")
+            or meta.get("image_queries")
+            or meta.get("img_query")
+            or meta.get("query_image")
+        )
+        if query_meta is None:
+            return None
+        if isinstance(query_meta, list):
+            if len(query_meta) == 0:
+                return None
+            query_meta = query_meta[0]
+        if isinstance(query_meta, dict):
+            rel_path = (
+                query_meta.get("filename")
+                or query_meta.get("path")
+                or query_meta.get("file")
+                or query_meta.get("name")
+            )
+        else:
+            rel_path = query_meta
+        if rel_path is None:
+            return None
+        abs_path = rel_path if os.path.isabs(rel_path) else os.path.join(self.query_root, rel_path)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"{abs_path} not found.")
+        query_image = Image.open(abs_path).convert('RGB')
+        query_tensor = self.query_transform(query_image)
+        return query_tensor
+
+    def _sample_query_from_bank(self, label_ids):
+        if not self.class_query_bank:
+            return None
+        available = [self.class_query_bank.get(str(lid), []) for lid in label_ids]
+        available = [paths for paths in available if paths]
+        if not available:
+            return None
+        selected_path = random.choice(random.choice(available))
+        if not os.path.exists(selected_path):
+            return None
+        query_image = Image.open(selected_path).convert("RGB")
+        query_tensor = self.query_transform(query_image)
+        return query_tensor
+
     def __getitem__(self, index: int):
         meta = self.metas[index]
         rel_path = meta["filename"]
@@ -65,6 +180,7 @@ class ODVGDataset(VisionDataset):
             raise FileNotFoundError(f"{abs_path} not found.")
         image = Image.open(abs_path).convert('RGB')
         w, h = image.size
+        pos_labels = None
         if self.dataset_mode == "OD":
             anno = meta["detection"]
             instances = [obj for obj in anno["instances"]]
@@ -117,6 +233,10 @@ class ODVGDataset(VisionDataset):
         target["boxes"] = boxes
         target["labels"] = classes
         # size, cap_list, caption, bboxes, labels
+        query_tensor = self._load_image_query(meta)
+        if query_tensor is None and self.auto_image_query and pos_labels:
+            query_tensor = self._sample_query_from_bank(list(pos_labels))
+        target["image_query"] = query_tensor
 
         if self.transforms is not None:
             image, target = self.transforms(image, target)
@@ -227,13 +347,25 @@ def build_odvg(image_set, args, datasetinfo):
     img_folder = datasetinfo["root"]
     ann_file = datasetinfo["anno"]
     label_map = datasetinfo["label_map"] if "label_map" in datasetinfo else None
+    auto_image_query = datasetinfo.get("auto_image_query", label_map is not None)
+    image_query_dir = datasetinfo.get("image_query_dir")
+    per_class_query_num = datasetinfo.get("per_class_query_num", 5)
+    query_root = datasetinfo.get("query_root")
     try:
         strong_aug = args.strong_aug
     except:
         strong_aug = False
     print(img_folder, ann_file, label_map)
-    dataset = ODVGDataset(img_folder, ann_file, label_map, max_labels=args.max_labels,
-            transforms=make_coco_transforms(image_set, fix_size=args.fix_size, strong_aug=strong_aug, args=args), 
+    dataset = ODVGDataset(
+        img_folder,
+        ann_file,
+        label_map,
+        max_labels=args.max_labels,
+        transforms=make_coco_transforms(image_set, fix_size=args.fix_size, strong_aug=strong_aug, args=args),
+        query_root=query_root,
+        auto_image_query=auto_image_query,
+        image_query_dir=image_query_dir,
+        per_class_query_num=per_class_query_num,
     )
     return dataset
 

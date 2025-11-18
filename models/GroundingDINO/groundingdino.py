@@ -15,7 +15,7 @@
 # Copyright (c) 2020 SenseTime. All Rights Reserved.
 # ------------------------------------------------------------------------
 import copy
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -154,6 +154,11 @@ class GroundingDINO(nn.Module):
                 ]
             )
 
+        self.image_query_proj = nn.Sequential(
+            nn.Conv2d(backbone.num_channels[-1], hidden_dim, kernel_size=1),
+            nn.GroupNorm(32, hidden_dim),
+        )
+
         self.backbone = backbone
         self.aux_loss = aux_loss
         self.box_pred_damping = box_pred_damping = None
@@ -213,7 +218,33 @@ class GroundingDINO(nn.Module):
     def init_ref_points(self, use_num_queries):
         self.refpoint_embed = nn.Embedding(use_num_queries, self.query_dim)
 
-    def forward(self, samples: NestedTensor, targets: List = None, **kw):
+    def _prepare_image_queries(self, image_queries):
+        if image_queries is None:
+            return None
+        if isinstance(image_queries, tuple):
+            image_queries = list(image_queries)
+        if not isinstance(image_queries, (list, tuple)) or len(image_queries) == 0:
+            return None
+        if any(q is None for q in image_queries):
+            return None
+        query_samples = nested_tensor_from_tensor_list(image_queries)
+        with torch.no_grad():
+            query_features, query_pos = self.backbone(query_samples)
+        query_src, query_mask = query_features[-1].decompose()
+        query_src = self.image_query_proj(query_src)
+        query_tokens = query_src.flatten(2).transpose(1, 2)
+        query_pos_embed = query_pos[-1].flatten(2).transpose(1, 2)
+        query_tokens = (query_tokens + query_pos_embed).detach()
+        query_mask = query_mask.flatten(1)
+        return {"tokens": query_tokens, "mask": query_mask}
+
+    def forward(
+        self,
+        samples: NestedTensor,
+        targets: List = None,
+        image_queries: Optional[List[torch.Tensor]] = None,
+        **kw,
+    ):
         """The forward expects a NestedTensor, which consists of:
            - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
            - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -232,6 +263,8 @@ class GroundingDINO(nn.Module):
             captions = kw["captions"]
         else:
             captions = [t["caption"] for t in targets]
+        if image_queries is None:
+            image_queries = kw.get("image_queries")
         # encoder texts
 
         tokenized = self.tokenizer(captions, padding="longest", return_tensors="pt").to(
@@ -285,6 +318,9 @@ class GroundingDINO(nn.Module):
             "position_ids": position_ids,  # bs, 195
             "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
         }
+        image_query_dict = self._prepare_image_queries(image_queries)
+        if image_query_dict is not None:
+            text_dict["image_query"] = image_query_dict
 
 
         if isinstance(samples, (list, torch.Tensor)):

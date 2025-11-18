@@ -7,8 +7,8 @@ NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
 PORT=${PORT:-29500}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-PRETRAIN_MODEL_PATH=${PRETRAIN_MODEL_PATH:-"/path/to/groundingdino_swint_ogc.pth"}
-TEXT_ENCODER_TYPE=${TEXT_ENCODER_TYPE:-"/path/to/bert-base-uncased"}
+PRETRAIN_MODEL_PATH=${PRETRAIN_MODEL_PATH:-"./weights/groundingdino_swint_ogc.pth"}
+TEXT_ENCODER_TYPE=${TEXT_ENCODER_TYPE:-"./weights/bert"}
 echo "
 GPU_NUM = $GPU_NUM
 CFG = $CFG
@@ -31,4 +31,5 @@ python -m torch.distributed.launch  --nproc_per_node="${GPU_NUM}" main.py \
         -c "${CFG}" \
         --datasets "${DATASETS}"  \
         --pretrain_model_path "${PRETRAIN_MODEL_PATH}" \
+        --find_unused_params \
         --options text_encoder_type="$TEXT_ENCODER_TYPE"

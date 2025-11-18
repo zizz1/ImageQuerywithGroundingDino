@@ -3,6 +3,7 @@ import os
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
+import torchvision.transforms as tvT
 
 # please make sure https://github.com/IDEA-Research/GroundingDINO is installed correctly.
 import groundingdino.datasets.transforms as T
@@ -80,7 +81,7 @@ def load_model(model_config_path, model_checkpoint_path, cpu_only=False):
     return model
 
 
-def get_grounding_output(model, image, caption, box_threshold, text_threshold=None, with_logits=True, cpu_only=False, token_spans=None):
+def get_grounding_output(model, image, caption, box_threshold, text_threshold=None, with_logits=True, cpu_only=False, token_spans=None, image_queries=None):
     assert text_threshold is not None or token_spans is not None, "text_threshould and token_spans should not be None at the same time!"
     caption = caption.lower()
     caption = caption.strip()
@@ -89,8 +90,11 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
     device = "cuda" if not cpu_only else "cpu"
     model = model.to(device)
     image = image.to(device)
+    query_tensors = None
+    if image_queries:
+        query_tensors = [q.to(device) for q in image_queries]
     with torch.no_grad():
-        outputs = model(image[None], captions=[caption])
+        outputs = model(image[None], captions=[caption], image_queries=query_tensors)
     logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
     boxes = outputs["pred_boxes"][0]  # (nq, 4)
 
@@ -145,6 +149,27 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
     return boxes_filt, pred_phrases
 
 
+def load_image_queries(paths):
+    if paths is None:
+        return None
+    if isinstance(paths, str):
+        paths = [paths]
+    transform = tvT.Compose(
+        [
+            tvT.Resize((224, 224)),
+            tvT.ToTensor(),
+            tvT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    tensors = []
+    for path in paths:
+        if not path:
+            continue
+        img = Image.open(path).convert("RGB")
+        tensors.append(transform(img))
+    return tensors if len(tensors) > 0 else None
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser("Grounding DINO example", add_help=True)
@@ -157,6 +182,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir", "-o", type=str, default="outputs", required=True, help="output directory"
     )
+    parser.add_argument("--image_query", "-q", type=str, nargs="+", default=None, help="path(s) to reference image(s) used as image queries")
 
     parser.add_argument("--box_threshold", type=float, default=0.3, help="box threshold")
     parser.add_argument("--text_threshold", type=float, default=0.25, help="text threshold")
@@ -179,11 +205,13 @@ if __name__ == "__main__":
     box_threshold = args.box_threshold
     text_threshold = args.text_threshold
     token_spans = args.token_spans
+    image_query_paths = args.image_query
 
     # make dir
     os.makedirs(output_dir, exist_ok=True)
     # load image
     image_pil, image = load_image(image_path)
+    image_queries = load_image_queries(image_query_paths)
     # load model
     model = load_model(config_file, checkpoint_path, cpu_only=args.cpu_only)
 
@@ -198,7 +226,14 @@ if __name__ == "__main__":
 
     # run model
     boxes_filt, pred_phrases = get_grounding_output(
-        model, image, text_prompt, box_threshold, text_threshold, cpu_only=args.cpu_only, token_spans=token_spans
+        model,
+        image,
+        text_prompt,
+        box_threshold,
+        text_threshold,
+        cpu_only=args.cpu_only,
+        token_spans=token_spans,
+        image_queries=image_queries,
     )
 
     # visualize pred

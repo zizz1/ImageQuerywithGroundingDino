@@ -118,6 +118,9 @@ class Transformer(nn.Module):
             feature_fusion_layer=feature_fusion_layer,
             use_checkpoint=use_checkpoint,
             use_transformer_ckpt=use_transformer_ckpt,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
         )
 
         # choose decoder layer type
@@ -267,6 +270,7 @@ class Transformer(nn.Module):
             # we ~ the mask . False means use the token; True means pad the token
             position_ids=text_dict["position_ids"],
             text_self_attention_masks=text_dict["text_self_attention_masks"],
+            image_query_dict=text_dict.get("image_query"),
         )
         #########################################################
         # End Encoder
@@ -419,6 +423,9 @@ class TransformerEncoder(nn.Module):
         feature_fusion_layer=None,
         use_checkpoint=False,
         use_transformer_ckpt=False,
+        nhead=8,
+        dim_feedforward=2048,
+        dropout=0.0,
     ):
         """_summary_
 
@@ -466,6 +473,20 @@ class TransformerEncoder(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.use_transformer_ckpt = use_transformer_ckpt
 
+        self.image_query_pool_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        self.image_query_pool_norm = nn.LayerNorm(d_model)
+        self.image_query_pool_dropout = nn.Dropout(dropout)
+        self.prefusion_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        self.prefusion_attn_norm = nn.LayerNorm(d_model)
+        self.prefusion_attn_dropout = nn.Dropout(dropout)
+        self.prefusion_ffn = MLP(d_model, dim_feedforward, d_model, 2)
+        self.prefusion_ffn_norm = nn.LayerNorm(d_model)
+        self.prefusion_ffn_dropout = nn.Dropout(dropout)
+
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
         reference_points_list = []
@@ -498,6 +519,7 @@ class TransformerEncoder(nn.Module):
         pos_text: Tensor = None,
         text_self_attention_masks: Tensor = None,
         position_ids: Tensor = None,
+        image_query_dict: Optional[dict] = None,
     ):
         """
         Input:
@@ -514,6 +536,9 @@ class TransformerEncoder(nn.Module):
             - pos_text: bs, n_text, 256
 
             - position_ids: bs, n_text
+            - image_query_dict: optional dict with keys:
+                * tokens: [bs, n_img_query, 256]
+                * mask: [bs, n_img_query]
         Intermedia:
             - reference_points: [bs, sum(hi*wi), num_level, 2]
         Outpus:
@@ -545,28 +570,14 @@ class TransformerEncoder(nn.Module):
                     position_ids[..., None], num_pos_feats=256, exchange_xy=False
                 )
 
+        image_query_tokens = None
+        image_query_mask = None
+        if image_query_dict is not None:
+            image_query_tokens = image_query_dict.get("tokens", None)
+            image_query_mask = image_query_dict.get("mask", None)
+
         # main process
         for layer_id, layer in enumerate(self.layers):
-            # if output.isnan().any() or memory_text.isnan().any():
-            #     if os.environ.get('IPDB_SHILONG_DEBUG', None) == 'INFO':
-            #         import ipdb; ipdb.set_trace()
-            if self.fusion_layers:
-                if self.use_checkpoint:
-                    output, memory_text = checkpoint.checkpoint(
-                        self.fusion_layers[layer_id],
-                        output,
-                        memory_text,
-                        key_padding_mask,
-                        text_attention_mask,
-                    )
-                else:
-                    output, memory_text = self.fusion_layers[layer_id](
-                        v=output,
-                        l=memory_text,
-                        attention_mask_v=key_padding_mask,
-                        attention_mask_l=text_attention_mask,
-                    )
-
             if self.text_layers:
                 memory_text = self.text_layers[layer_id](
                     src=memory_text.transpose(0, 1),
@@ -574,6 +585,36 @@ class TransformerEncoder(nn.Module):
                     src_key_padding_mask=text_attention_mask,
                     pos=(pos_text.transpose(0, 1) if pos_text is not None else None),
                 ).transpose(0, 1)
+
+            fused_text = memory_text
+            if fused_text is not None and image_query_tokens is not None:
+                fused_text = self._apply_image_query_prefusion(
+                    fused_text,
+                    text_attention_mask,
+                    image_query_tokens,
+                    image_query_mask,
+                )
+
+            if self.fusion_layers and fused_text is not None:
+                if self.use_checkpoint:
+                    output, fused_text = checkpoint.checkpoint(
+                        self.fusion_layers[layer_id],
+                        output,
+                        fused_text,
+                        key_padding_mask,
+                        text_attention_mask,
+                        use_reentrant=False,
+                    )
+                else:
+                    output, fused_text = self.fusion_layers[layer_id](
+                        v=output,
+                        l=fused_text,
+                        attention_mask_v=key_padding_mask,
+                        attention_mask_l=text_attention_mask,
+                    )
+
+            if fused_text is not None:
+                memory_text = fused_text
 
             # main process
             if self.use_transformer_ckpt:
@@ -585,6 +626,7 @@ class TransformerEncoder(nn.Module):
                     spatial_shapes,
                     level_start_index,
                     key_padding_mask,
+                    use_reentrant=False,
                 )
             else:
                 output = layer(
@@ -597,6 +639,35 @@ class TransformerEncoder(nn.Module):
                 )
 
         return output, memory_text
+
+    def _apply_image_query_prefusion(
+        self,
+        text_tokens: Tensor,
+        text_attention_mask: Optional[Tensor],
+        image_query_tokens: Tensor,
+        image_query_mask: Optional[Tensor],
+    ) -> Tensor:
+        pooled, _ = self.image_query_pool_attn(
+            text_tokens,
+            image_query_tokens,
+            image_query_tokens,
+            key_padding_mask=image_query_mask,
+        )
+        pooled = self.image_query_pool_norm(
+            text_tokens + self.image_query_pool_dropout(pooled)
+        )
+        fused, _ = self.prefusion_attn(
+            pooled,
+            text_tokens,
+            text_tokens,
+            key_padding_mask=text_attention_mask,
+        )
+        fused = self.prefusion_attn_norm(
+            pooled + self.prefusion_attn_dropout(fused)
+        )
+        fused = fused + self.prefusion_ffn_dropout(self.prefusion_ffn(fused))
+        fused = self.prefusion_ffn_norm(fused)
+        return fused
 
 
 class TransformerDecoder(nn.Module):

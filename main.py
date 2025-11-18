@@ -82,6 +82,61 @@ def build_model_main(args):
     return model, criterion, postprocessors
 
 
+def _save_training_curves(train_history, eval_history, output_dir, logger=None):
+    if not output_dir or len(train_history) == 0 or not utils.is_main_process():
+        return
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        if logger is not None:
+            logger.warning("matplotlib not found, skip plotting training curves.")
+        return
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    epochs = [entry["epoch"] for entry in train_history]
+    train_loss = [entry.get("loss", 0.0) for entry in train_history]
+
+    fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+
+    axes[0].plot(epochs, train_loss, label="train loss", marker="o")
+    eval_loss_epochs = [
+        (entry["epoch"], entry.get("loss")) for entry in eval_history if entry.get("loss") is not None
+    ]
+    if len(eval_loss_epochs) > 0:
+        eval_epochs, eval_losses = zip(*eval_loss_epochs)
+        axes[0].plot(eval_epochs, eval_losses, label="eval loss", marker="x")
+    axes[0].set_ylabel("loss")
+    axes[0].set_title("Loss Curves")
+    axes[0].grid(True, linestyle="--", alpha=0.4)
+    axes[0].legend()
+
+    eval_map_epochs = [
+        (entry["epoch"], entry.get("coco_eval_bbox"))
+        for entry in eval_history
+        if entry.get("coco_eval_bbox") is not None
+    ]
+    if len(eval_map_epochs) > 0:
+        eval_map_epochs_vals, eval_maps = zip(*eval_map_epochs)
+        axes[1].plot(eval_map_epochs_vals, eval_maps, label="eval mAP", marker="s", color="tab:green")
+    axes[1].set_xlabel("epoch")
+    axes[1].set_ylabel("mAP")
+    axes[1].set_title("Evaluation mAP")
+    axes[1].grid(True, linestyle="--", alpha=0.4)
+    if len(eval_map_epochs) > 0:
+        axes[1].legend()
+
+    fig.tight_layout()
+    curve_path = out_dir / "training_curve.png"
+    fig.savefig(curve_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    if logger is not None:
+        logger.info(f"Training curve saved to {curve_path}")
+
+
 def main(args):
     
 
@@ -150,7 +205,8 @@ def main(args):
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
-        model._set_static_graph()
+        if not args.find_unused_params:
+            model._set_static_graph()
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info('number of params:'+str(n_parameters))
@@ -276,6 +332,8 @@ def main(args):
     print("Start training")
     start_time = time.time()
     best_map_holder = BestMetricHolder(use_ema=False)
+    train_history = []
+    eval_history = []
 
     for epoch in range(args.start_epoch, args.epochs):
         epoch_start_time = time.time()
@@ -285,6 +343,7 @@ def main(args):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
             args.clip_max_norm, wo_class_error=wo_class_error, lr_scheduler=lr_scheduler, args=args, logger=(logger if args.save_log else None))
+        train_history.append({"epoch": epoch, "loss": train_stats.get("loss", 0.0)})
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
 
@@ -311,6 +370,12 @@ def main(args):
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
             wo_class_error=wo_class_error, args=args, logger=(logger if args.save_log else None)
         )
+        eval_entry = {"epoch": epoch}
+        if "loss" in test_stats:
+            eval_entry["loss"] = test_stats["loss"]
+        if "coco_eval_bbox" in test_stats and isinstance(test_stats["coco_eval_bbox"], (list, tuple)) and len(test_stats["coco_eval_bbox"]) > 0:
+            eval_entry["coco_eval_bbox"] = test_stats["coco_eval_bbox"][0]
+        eval_history.append(eval_entry)
         map_regular = test_stats['coco_eval_bbox'][0]
         _isbest = best_map_holder.update(map_regular, epoch, is_ema=False)
         if _isbest:
@@ -351,6 +416,7 @@ def main(args):
                     for name in filenames:
                         torch.save(coco_evaluator.coco_eval["bbox"].eval,
                                    output_dir / "eval" / name)
+    _save_training_curves(train_history, eval_history, args.output_dir, logger if args.save_log else None)
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))

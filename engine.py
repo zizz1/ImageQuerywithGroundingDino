@@ -42,9 +42,15 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples = samples.to(device)
         captions = [t["caption"] for t in targets]
         cap_list = [t["cap_list"] for t in targets]
+        image_queries = [t.pop("image_query", None) for t in targets]
         targets = [{k: v.to(device) for k, v in t.items() if torch.is_tensor(v)} for t in targets]
+        query_tensors = None
+        if image_queries and any(q is not None for q in image_queries):
+            query_tensors = [
+                q.to(device) if isinstance(q, torch.Tensor) else None for q in image_queries
+            ]
         with torch.cuda.amp.autocast(enabled=args.amp):
-            outputs = model(samples, captions=captions)
+            outputs = model(samples, captions=captions, image_queries=query_tensors)
             loss_dict = criterion(outputs, targets, cap_list, captions)
 
             weight_dict = criterion.weight_dict
@@ -161,13 +167,19 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     for samples, targets in metric_logger.log_every(data_loader, 10, header, logger=logger):
         samples = samples.to(device)
 
+        image_queries = [t.pop("image_query", None) for t in targets]
         targets = [{k: to_device(v, device) for k, v in t.items()} for t in targets]
+        query_tensors = None
+        if image_queries and any(q is not None for q in image_queries):
+            query_tensors = [
+                to_device(q, device) if isinstance(q, torch.Tensor) else None for q in image_queries
+            ]
 
         bs = samples.tensors.shape[0]
         input_captions = [caption] * bs
         with torch.cuda.amp.autocast(enabled=args.amp):
 
-            outputs = model(samples, captions=input_captions)
+            outputs = model(samples, captions=input_captions, image_queries=query_tensors)
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 

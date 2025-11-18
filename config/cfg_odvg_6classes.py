@@ -56,7 +56,7 @@ lr_linear_proj_names = ['ref_point_head', 'sampling_offsets']
 weight_decay = 0.0001
 param_dict_type = 'ddetr_in_mmdet'
 ddetr_lr_param = False
-epochs = 10
+epochs = 15
 lr_drop = 4
 save_checkpoint_interval = 1
 clip_max_norm = 0.1
@@ -117,16 +117,4 @@ use_detached_boxes_dec_out = False
 use_coco_eval = False
 dn_scalar = 100
 
-label_list = [
-    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 
-    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 
-    'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 
-    'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 
-    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 
-    'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 
-    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 
-    'chair', 'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 
-    'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 
-    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 
-    'toothbrush'
-]
+label_list=['Capacitor', 'Diode', 'NMOS', 'NPNPNP', 'PMOS', 'Resistor']
