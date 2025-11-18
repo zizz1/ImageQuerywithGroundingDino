@@ -5,7 +5,7 @@
       "anno": "./coco/annotations/instances_train2017_odvg.jsonl",
       "label_map": "./config/coco2017_label_map.json",
       "dataset_mode": "odvg",
-      "per_class_query_num": 10
+      "per_class_query_num": 50
     }
   ],
   "val": [

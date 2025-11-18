@@ -218,31 +218,52 @@ class GroundingDINO(nn.Module):
     def init_ref_points(self, use_num_queries):
         self.refpoint_embed = nn.Embedding(use_num_queries, self.query_dim)
 
-    def _prepare_image_queries(self, image_queries):
-        if image_queries is None:
+    def _encode_query_set(self, tensor_list):
+        tensor_list = [t for t in tensor_list if isinstance(t, torch.Tensor)]
+        if len(tensor_list) == 0:
             return None
-        if isinstance(image_queries, tuple):
-            image_queries = list(image_queries)
-        if not isinstance(image_queries, (list, tuple)) or len(image_queries) == 0:
-            return None
-        if any(q is None for q in image_queries):
-            return None
-        query_samples = nested_tensor_from_tensor_list(image_queries)
+        query_samples = nested_tensor_from_tensor_list(tensor_list)
         with torch.no_grad():
             query_features, query_pos = self.backbone(query_samples)
-        query_src, query_mask = query_features[-1].decompose()
+        query_src, _ = query_features[-1].decompose()
         query_src = self.image_query_proj(query_src)
         query_tokens = query_src.flatten(2).transpose(1, 2)
         query_pos_embed = query_pos[-1].flatten(2).transpose(1, 2)
-        query_tokens = (query_tokens + query_pos_embed).detach()
-        query_mask = query_mask.flatten(1)
-        return {"tokens": query_tokens, "mask": query_mask}
+        query_tokens = (query_tokens + query_pos_embed).mean(dim=1)
+        return query_tokens.detach()
+
+    def _prepare_image_queries(self, image_queries, caption_lists):
+        if image_queries is None or caption_lists is None:
+            return None
+        processed = []
+        for per_sample, cap_list in zip(image_queries, caption_lists):
+            if per_sample is None:
+                processed.append(None)
+                continue
+            if isinstance(per_sample, dict):
+                encoded = {}
+                for label, tensors in per_sample.items():
+                    tensor_list = tensors if isinstance(tensors, list) else [tensors]
+                    vec = self._encode_query_set(tensor_list)
+                    if vec is not None:
+                        encoded[label] = vec
+                processed.append(encoded if encoded else None)
+            else:
+                tensor_list = per_sample if isinstance(per_sample, list) else [per_sample]
+                vec = self._encode_query_set(tensor_list)
+                processed.append({"__shared__": vec} if vec is not None else None)
+        return processed if any(processed) else None
+
+    def _split_caption_to_list(self, caption):
+        segments = [seg.strip() for seg in caption.split(".") if seg.strip()]
+        return segments if segments else [caption.strip()]
 
     def forward(
         self,
         samples: NestedTensor,
         targets: List = None,
-        image_queries: Optional[List[torch.Tensor]] = None,
+        image_queries: Optional[List] = None,
+        caption_lists: Optional[List[List[str]]] = None,
         **kw,
     ):
         """The forward expects a NestedTensor, which consists of:
@@ -261,8 +282,11 @@ class GroundingDINO(nn.Module):
         """
         if targets is None:
             captions = kw["captions"]
+            if caption_lists is None:
+                caption_lists = [self._split_caption_to_list(cap) for cap in captions]
         else:
             captions = [t["caption"] for t in targets]
+            caption_lists = [t["cap_list"] for t in targets]
         if image_queries is None:
             image_queries = kw.get("image_queries")
         # encoder texts
@@ -317,10 +341,12 @@ class GroundingDINO(nn.Module):
             "text_token_mask": text_token_mask,  # bs, 195
             "position_ids": position_ids,  # bs, 195
             "text_self_attention_masks": text_self_attention_masks,  # bs, 195,195
+            "cate_to_token_masks": cate_to_token_mask_list,
+            "caption_list": caption_lists,
         }
-        image_query_dict = self._prepare_image_queries(image_queries)
-        if image_query_dict is not None:
-            text_dict["image_query"] = image_query_dict
+        processed_queries = self._prepare_image_queries(image_queries, caption_lists)
+        if processed_queries is not None:
+            text_dict["image_query"] = processed_queries
 
 
         if isinstance(samples, (list, torch.Tensor)):

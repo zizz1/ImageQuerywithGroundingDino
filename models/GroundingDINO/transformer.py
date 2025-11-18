@@ -16,7 +16,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 # ------------------------------------------------------------------------
 
-from typing import Optional
+from typing import Optional, List, Dict
 
 import torch
 import torch.utils.checkpoint as checkpoint
@@ -271,6 +271,8 @@ class Transformer(nn.Module):
             position_ids=text_dict["position_ids"],
             text_self_attention_masks=text_dict["text_self_attention_masks"],
             image_query_dict=text_dict.get("image_query"),
+            caption_list=text_dict.get("caption_list"),
+            cate_to_token_masks=text_dict.get("cate_to_token_masks"),
         )
         #########################################################
         # End Encoder
@@ -519,7 +521,9 @@ class TransformerEncoder(nn.Module):
         pos_text: Tensor = None,
         text_self_attention_masks: Tensor = None,
         position_ids: Tensor = None,
-        image_query_dict: Optional[dict] = None,
+        image_query_dict: Optional[List[Dict[str, Tensor]]] = None,
+        caption_list: Optional[List[List[str]]] = None,
+        cate_to_token_masks: Optional[List[Tensor]] = None,
     ):
         """
         Input:
@@ -570,12 +574,6 @@ class TransformerEncoder(nn.Module):
                     position_ids[..., None], num_pos_feats=256, exchange_xy=False
                 )
 
-        image_query_tokens = None
-        image_query_mask = None
-        if image_query_dict is not None:
-            image_query_tokens = image_query_dict.get("tokens", None)
-            image_query_mask = image_query_dict.get("mask", None)
-
         # main process
         for layer_id, layer in enumerate(self.layers):
             if self.text_layers:
@@ -586,14 +584,15 @@ class TransformerEncoder(nn.Module):
                     pos=(pos_text.transpose(0, 1) if pos_text is not None else None),
                 ).transpose(0, 1)
 
-            fused_text = memory_text
-            if fused_text is not None and image_query_tokens is not None:
-                fused_text = self._apply_image_query_prefusion(
-                    fused_text,
-                    text_attention_mask,
-                    image_query_tokens,
-                    image_query_mask,
+            if image_query_dict is not None:
+                memory_text = self._inject_phrase_queries(
+                    memory_text,
+                    image_query_dict,
+                    cate_to_token_masks,
+                    caption_list,
                 )
+
+            fused_text = memory_text
 
             if self.fusion_layers and fused_text is not None:
                 if self.use_checkpoint:
@@ -668,6 +667,43 @@ class TransformerEncoder(nn.Module):
         fused = fused + self.prefusion_ffn_dropout(self.prefusion_ffn(fused))
         fused = self.prefusion_ffn_norm(fused)
         return fused
+
+    def _inject_phrase_queries(
+        self,
+        memory_text: Tensor,
+        image_query_embeddings: List[Optional[Dict[str, Tensor]]],
+        cate_to_token_masks: Optional[List[Tensor]],
+        caption_list: Optional[List[List[str]]],
+    ) -> Tensor:
+        bs = memory_text.shape[0]
+        if image_query_embeddings is None:
+            return memory_text
+        for i in range(bs):
+            sample_queries = (
+                image_query_embeddings[i] if i < len(image_query_embeddings) else None
+            )
+            if not sample_queries:
+                continue
+            shared_vec = sample_queries.get("__shared__")
+            sample_masks = cate_to_token_masks[i] if cate_to_token_masks and i < len(cate_to_token_masks) else None
+            sample_captions = caption_list[i] if caption_list and i < len(caption_list) else None
+            if sample_masks is None or sample_captions is None:
+                if shared_vec is not None:
+                    memory_text[i] = memory_text[i] + shared_vec.unsqueeze(0)
+                continue
+            num_phrase = sample_masks.shape[0]
+            for j in range(num_phrase):
+                mask = sample_masks[j]
+                label = sample_captions[j] if j < len(sample_captions) else None
+                query_vec = None
+                if label and label in sample_queries:
+                    query_vec = sample_queries[label]
+                elif shared_vec is not None:
+                    query_vec = shared_vec
+                if query_vec is None:
+                    continue
+                memory_text[i, mask, :] = memory_text[i, mask, :] + query_vec.unsqueeze(0)
+        return memory_text
 
 
 class TransformerDecoder(nn.Module):

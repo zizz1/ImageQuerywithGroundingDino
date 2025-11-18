@@ -81,7 +81,7 @@ class ODVGDataset(VisionDataset):
     def _prepare_image_query_bank(self):
         os.makedirs(self.image_query_dir, exist_ok=True)
         for label_id, label_name in self.label_map.items():
-            bank_key = str(label_id)
+            bank_key = label_name
             label_dir = os.path.join(self.image_query_dir, label_name.replace(" ", "_"))
             os.makedirs(label_dir, exist_ok=True)
             stored_paths = []
@@ -158,19 +158,53 @@ class ODVGDataset(VisionDataset):
         query_tensor = self.query_transform(query_image)
         return query_tensor
 
-    def _sample_query_from_bank(self, label_ids):
+    def _load_manual_query_dict(self, meta):
+        query_dict = {}
+        dict_meta = meta.get("image_query_dict")
+        if dict_meta:
+            for label, paths in dict_meta.items():
+                if isinstance(paths, str):
+                    paths = [paths]
+                tensors = []
+                for path in paths:
+                    abs_path = path if os.path.isabs(path) else os.path.join(self.query_root, path)
+                    if not os.path.exists(abs_path):
+                        continue
+                    query_image = Image.open(abs_path).convert("RGB")
+                    tensors.append(self.query_transform(query_image))
+                if tensors:
+                    query_dict[label] = tensors
+        shared_query = self._load_image_query(meta)
+        if shared_query is not None:
+            query_dict.setdefault("__shared__", []).append(shared_query)
+        return query_dict
+
+    def _merge_query_sources(self, manual_dict, auto_dict):
+        if not manual_dict and not auto_dict:
+            return None
+        merged = {}
+        for source in (manual_dict, auto_dict):
+            if not source:
+                continue
+            for label, tensors in source.items():
+                merged.setdefault(label, []).extend(tensors)
+        return merged if merged else None
+
+    def _sample_query_from_bank(self, label_names):
         if not self.class_query_bank:
-            return None
-        available = [self.class_query_bank.get(str(lid), []) for lid in label_ids]
-        available = [paths for paths in available if paths]
-        if not available:
-            return None
-        selected_path = random.choice(random.choice(available))
-        if not os.path.exists(selected_path):
-            return None
-        query_image = Image.open(selected_path).convert("RGB")
-        query_tensor = self.query_transform(query_image)
-        return query_tensor
+            return {}
+        sample_dict = {}
+        for name in label_names:
+            path_list = self.class_query_bank.get(name)
+            if not path_list:
+                continue
+            selected_path = random.choice(path_list)
+            if not os.path.exists(selected_path):
+                continue
+            query_image = Image.open(selected_path).convert("RGB")
+            query_tensor = self.query_transform(query_image)
+            sample_dict.setdefault(name, []).append(query_tensor)
+        return sample_dict
 
     def __getitem__(self, index: int):
         meta = self.metas[index]
@@ -232,11 +266,12 @@ class ODVGDataset(VisionDataset):
         target["caption"] = caption
         target["boxes"] = boxes
         target["labels"] = classes
-        # size, cap_list, caption, bboxes, labels
-        query_tensor = self._load_image_query(meta)
-        if query_tensor is None and self.auto_image_query and pos_labels:
-            query_tensor = self._sample_query_from_bank(list(pos_labels))
-        target["image_query"] = query_tensor
+        manual_query_dict = self._load_manual_query_dict(meta)
+        auto_query_dict = {}
+        if self.auto_image_query and pos_labels:
+            label_names = [self.label_map[str(lb)] for lb in pos_labels if str(lb) in self.label_map]
+            auto_query_dict = self._sample_query_from_bank(label_names)
+        target["image_query_dict"] = self._merge_query_sources(manual_query_dict, auto_query_dict)
 
         if self.transforms is not None:
             image, target = self.transforms(image, target)

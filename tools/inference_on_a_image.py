@@ -81,7 +81,17 @@ def load_model(model_config_path, model_checkpoint_path, cpu_only=False):
     return model
 
 
-def get_grounding_output(model, image, caption, box_threshold, text_threshold=None, with_logits=True, cpu_only=False, token_spans=None, image_queries=None):
+def get_grounding_output(
+    model,
+    image,
+    caption,
+    box_threshold,
+    text_threshold=None,
+    with_logits=True,
+    cpu_only=False,
+    token_spans=None,
+    image_queries=None,
+):
     assert text_threshold is not None or token_spans is not None, "text_threshould and token_spans should not be None at the same time!"
     caption = caption.lower()
     caption = caption.strip()
@@ -90,11 +100,25 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
     device = "cuda" if not cpu_only else "cpu"
     model = model.to(device)
     image = image.to(device)
-    query_tensors = None
+    caption_list = parse_caption_to_list(caption)
+    query_payload = None
     if image_queries:
-        query_tensors = [q.to(device) for q in image_queries]
+        if isinstance(image_queries, dict):
+            processed = {}
+            for label, tensors in image_queries.items():
+                tensor_list = tensors if isinstance(tensors, list) else [tensors]
+                converted = [tensor.to(device) for tensor in tensor_list]
+                processed[label] = converted
+            query_payload = processed
+        elif isinstance(image_queries, list):
+            query_payload = [tensor.to(device) for tensor in image_queries]
     with torch.no_grad():
-        outputs = model(image[None], captions=[caption], image_queries=query_tensors)
+        outputs = model(
+            image[None],
+            captions=[caption],
+            image_queries=[query_payload] if query_payload is not None else None,
+            caption_lists=[caption_list],
+        )
     logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
     boxes = outputs["pred_boxes"][0]  # (nq, 4)
 
@@ -161,13 +185,34 @@ def load_image_queries(paths):
             tvT.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
-    tensors = []
-    for path in paths:
-        if not path:
+    per_class = {}
+    shared = []
+    for entry in paths:
+        if not entry:
             continue
+        label = None
+        path = entry
+        if "=" in entry:
+            label, path = entry.split("=", 1)
+            label = label.strip()
+            path = path.strip()
         img = Image.open(path).convert("RGB")
-        tensors.append(transform(img))
-    return tensors if len(tensors) > 0 else None
+        tensor = transform(img)
+        if label:
+            per_class.setdefault(label, []).append(tensor)
+        else:
+            shared.append(tensor)
+    if per_class:
+        if shared:
+            per_class["__shared__"] = shared
+        return per_class
+    if shared:
+        return shared
+    return None
+
+
+def parse_caption_to_list(caption):
+    return [seg.strip() for seg in caption.split(".") if seg.strip()]
 
 
 if __name__ == "__main__":
@@ -182,7 +227,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir", "-o", type=str, default="outputs", required=True, help="output directory"
     )
-    parser.add_argument("--image_query", "-q", type=str, nargs="+", default=None, help="path(s) to reference image(s) used as image queries")
+    parser.add_argument("--image_query", "-q", type=str, nargs="+", default=None, help="reference images; use 'Label=path.jpg' to bind a query to a specific class")
 
     parser.add_argument("--box_threshold", type=float, default=0.3, help="box threshold")
     parser.add_argument("--text_threshold", type=float, default=0.25, help="text threshold")

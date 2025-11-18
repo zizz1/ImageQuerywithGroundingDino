@@ -42,15 +42,31 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples = samples.to(device)
         captions = [t["caption"] for t in targets]
         cap_list = [t["cap_list"] for t in targets]
-        image_queries = [t.pop("image_query", None) for t in targets]
+        image_query_dicts = [t.pop("image_query_dict", None) for t in targets]
         targets = [{k: v.to(device) for k, v in t.items() if torch.is_tensor(v)} for t in targets]
-        query_tensors = None
-        if image_queries and any(q is not None for q in image_queries):
-            query_tensors = [
-                q.to(device) if isinstance(q, torch.Tensor) else None for q in image_queries
-            ]
+        query_payload = None
+        if image_query_dicts and any(q is not None for q in image_query_dicts):
+            query_payload = []
+            for query_dict in image_query_dicts:
+                if query_dict is None:
+                    query_payload.append(None)
+                    continue
+                processed = {}
+                for label, tensors in query_dict.items():
+                    tensor_list = tensors if isinstance(tensors, list) else [tensors]
+                    converted = [
+                        tensor.to(device) for tensor in tensor_list if isinstance(tensor, torch.Tensor)
+                    ]
+                    if converted:
+                        processed[label] = converted
+                query_payload.append(processed if processed else None)
         with torch.cuda.amp.autocast(enabled=args.amp):
-            outputs = model(samples, captions=captions, image_queries=query_tensors)
+            outputs = model(
+                samples,
+                captions=captions,
+                image_queries=query_payload,
+                caption_lists=cap_list,
+            )
             loss_dict = criterion(outputs, targets, cap_list, captions)
 
             weight_dict = criterion.weight_dict
@@ -167,19 +183,38 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     for samples, targets in metric_logger.log_every(data_loader, 10, header, logger=logger):
         samples = samples.to(device)
 
-        image_queries = [t.pop("image_query", None) for t in targets]
+        image_query_dicts = [t.pop("image_query_dict", None) for t in targets]
         targets = [{k: to_device(v, device) for k, v in t.items()} for t in targets]
-        query_tensors = None
-        if image_queries and any(q is not None for q in image_queries):
-            query_tensors = [
-                to_device(q, device) if isinstance(q, torch.Tensor) else None for q in image_queries
-            ]
+        query_payload = None
+        if image_query_dicts and any(q is not None for q in image_query_dicts):
+            query_payload = []
+            for query_dict in image_query_dicts:
+                if query_dict is None:
+                    query_payload.append(None)
+                    continue
+                processed = {}
+                for label, tensors in query_dict.items():
+                    tensor_list = tensors if isinstance(tensors, list) else [tensors]
+                    converted = [
+                        to_device(tensor, device)
+                        for tensor in tensor_list
+                        if isinstance(tensor, torch.Tensor)
+                    ]
+                    if converted:
+                        processed[label] = converted
+                query_payload.append(processed if processed else None)
 
         bs = samples.tensors.shape[0]
         input_captions = [caption] * bs
+        caption_lists = [cat_list] * bs
         with torch.cuda.amp.autocast(enabled=args.amp):
 
-            outputs = model(samples, captions=input_captions, image_queries=query_tensors)
+            outputs = model(
+                samples,
+                captions=input_captions,
+                image_queries=query_payload,
+                caption_lists=caption_lists,
+            )
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
